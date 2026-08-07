@@ -22,6 +22,52 @@ except ImportError as exc:
 
 MODEL = "claude-sonnet-5"
 
+API_KEY_ERROR_MESSAGE = (
+    "APIキーが設定されていないか無効です。.env ファイルを確認してください"
+)
+
+
+class ApiKeyError(RuntimeError):
+    """ANTHROPIC_API_KEY が未設定、または認証に失敗した場合の例外。"""
+
+    def __init__(self, message: str = API_KEY_ERROR_MESSAGE):
+        super().__init__(message)
+
+
+def get_api_key() -> str | None:
+    """環境変数から ANTHROPIC_API_KEY を取得する。
+
+    .env に `ANTHROPIC_API_KEY="sk-ant-..."` のようにクォート付きで書かれていたり、
+    末尾に空白・改行が入っていたりすると 401 になるため、ここで取り除く。
+    未設定・空文字の場合は None を返す。
+    """
+    raw = os.environ.get("ANTHROPIC_API_KEY")
+    if raw is None:
+        return None
+    key = raw.strip().strip("'\"").strip()
+    return key or None
+
+
+def api_key_status_message() -> str | None:
+    """APIキーが使えない状態であれば警告メッセージを、問題なければ None を返す。"""
+    key = get_api_key()
+    if not key:
+        return API_KEY_ERROR_MESSAGE
+    if not key.startswith("sk-ant-"):
+        return (
+            f"{API_KEY_ERROR_MESSAGE}"
+            "(キーの形式が想定と異なります。`sk-ant-` で始まる値か確認してください)"
+        )
+    return None
+
+
+def get_anthropic_client() -> "anthropic.Anthropic":
+    """Anthropicクライアントを生成する。APIキーが未設定なら ApiKeyError を投げる。"""
+    key = get_api_key()
+    if not key:
+        raise ApiKeyError()
+    return anthropic.Anthropic(api_key=key)
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -482,13 +528,18 @@ def parse_plan(text: str) -> dict:
 
 
 def _call_claude_for_plan(user_prompt: str, worksheet_titles: list[str] | None) -> dict:
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    client = get_anthropic_client()
+    try:
+        message = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except anthropic.AuthenticationError as exc:  # 401 invalid x-api-key
+        raise ApiKeyError() from exc
+    except anthropic.PermissionDeniedError as exc:  # 403 (無効化されたキー等)
+        raise ApiKeyError() from exc
     text = "".join(block.text for block in message.content if block.type == "text")
     plan = parse_plan(text)
 

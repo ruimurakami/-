@@ -17,6 +17,7 @@ URLを入力し直す必要はない(セッション内でシートを保持す�
 """
 
 import os
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -24,7 +25,11 @@ from dotenv import load_dotenv
 
 import sheets_core
 
-load_dotenv()
+# 起動時のカレントディレクトリに関係なく、このファイルと同じ場所の .env を読み込む
+# (別ディレクトリから `streamlit run` した場合に ANTHROPIC_API_KEY が読めず
+#  401 invalid x-api-key になるのを防ぐ)。
+load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv()  # カレントディレクトリ側の .env も一応探す(既存の値は上書きしない)
 
 st.set_page_config(page_title="Sheets AI Assistant", page_icon="\U0001f4ca", layout="centered")
 
@@ -61,6 +66,17 @@ def _bind_ctrl_enter(button_text: str):
 @st.cache_resource
 def get_client():
     return sheets_core.get_client()
+
+
+def _show_api_key_warning():
+    """APIキーが未設定・不正な形式の場合に、画面上部に警告を出す。
+
+    ここで st.stop() はしない(シートの読み込みや履歴確認など、
+    Claudeを使わない操作は引き続き行えるようにするため)。
+    """
+    message = sheets_core.api_key_status_message()
+    if message:
+        st.warning(message)
 
 
 def _flash(kind: str, message: str):
@@ -728,6 +744,9 @@ def _execute_plan(plan: dict, attempt: int = 1):
                     worksheet_titles, st.session_state["worksheet_title"],
                     st.session_state.get("header_offset", 0), other_sheets,
                 )
+        except sheets_core.ApiKeyError as key_exc:
+            st.error(f"実行に失敗しました: {exc}\n\n{key_exc}")
+            return
         except Exception as fix_exc:  # noqa: BLE001
             st.error(f"実行に失敗しました: {exc}\n\n自動修正の生成にも失敗しました: {fix_exc}")
             return
@@ -783,6 +802,9 @@ def instruction_section():
                                 st.session_state.get("header_offset", 0),
                                 other_sheets,
                             )
+                except sheets_core.ApiKeyError as exc:
+                    with generate_placeholder.container():
+                        st.error(str(exc))
                 except Exception as exc:  # noqa: BLE001
                     with generate_placeholder.container():
                         st.error(f"生成に失敗しました: {exc}")
@@ -810,6 +832,7 @@ def main():
         st.rerun()
 
     _show_flash()
+    _show_api_key_warning()
     load_sheet_section()
 
     if st.session_state.get("sheet_loaded"):
