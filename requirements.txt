@@ -1,0 +1,6 @@
+anthropic
+gspread
+google-auth
+pandas
+python-dotenv
+streamlit
