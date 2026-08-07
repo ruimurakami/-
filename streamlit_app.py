@@ -68,6 +68,16 @@ def get_client():
     return sheets_core.get_client()
 
 
+def _show_format_failures():
+    """複数書式の一括適用で一部だけ失敗した場合に、どの範囲が失敗したかを表示する。"""
+    failures = st.session_state.pop("format_failures", None)
+    if not failures:
+        return
+    with st.expander(f"⚠️ {len(failures)}件の書式適用に失敗しました(内訳を表示)", expanded=True):
+        for item in failures:
+            st.write(f"- `{item['range']}`: {item['error']}")
+
+
 def _show_api_key_warning():
     """APIキーが未設定・不正な形式の場合に、画面上部に警告を出す。
 
@@ -204,6 +214,21 @@ def _push_history(entry: dict):
     st.session_state["redo_stack"] = []  # 新しい操作をしたらやり直し履歴は破棄する
 
 
+def _format_ops_of(entry: dict) -> list[dict]:
+    """apply_format の履歴から書式操作のリストを取り出す。
+
+    複数操作に対応する前に積まれた履歴(単一range形式)も同じ形に揃えて返す。
+    """
+    ops = entry.get("ops")
+    if ops:
+        return ops
+    return [{
+        "range": entry["range"],
+        "format": entry["format_spec"],
+        "prev_format": entry.get("prev_format"),
+    }]
+
+
 def _revert_entry(sh, entry: dict):
     """undo: entry の操作を取り消して直前の状態に戻す。"""
     action = entry["action"]
@@ -228,8 +253,10 @@ def _revert_entry(sh, entry: dict):
         st.session_state["header_offset"] = max(st.session_state.get("header_offset", 0) - entry["row_count"], 0)
     elif action == "apply_format":
         ws = sh.worksheet(entry["worksheet_title"])
-        restore_spec = entry["prev_format"] or sheets_core.DEFAULT_RESET_FORMAT
-        sheets_core.apply_cell_format(ws, entry["range"], restore_spec)
+        # 複数操作をまとめて適用した履歴は、適用時と逆順に、範囲ごとの適用前書式へ戻す。
+        for op in reversed(_format_ops_of(entry)):
+            restore_spec = op.get("prev_format") or sheets_core.DEFAULT_RESET_FORMAT
+            sheets_core.apply_cell_format(ws, op["range"], restore_spec)
 
 
 def _reapply_entry(sh, entry: dict):
@@ -270,7 +297,7 @@ def _reapply_entry(sh, entry: dict):
         st.session_state["header_offset"] = st.session_state.get("header_offset", 0) + entry["row_count"]
     elif action == "apply_format":
         ws = sh.worksheet(entry["worksheet_title"])
-        sheets_core.apply_cell_format(ws, entry["range"], entry["format_spec"])
+        sheets_core.apply_format_ops(ws, _format_ops_of(entry))
 
 
 def _undo_one() -> dict | None:
@@ -488,9 +515,20 @@ def _render_plan_pending(plan: dict, sh):
         for label, formula in rows:
             st.write(f"- {label}: `{formula}`")
     elif action == "apply_format":
-        range_label = plan.get("range") or "(現在のデータ範囲全体)"
-        st.info(f"現在開いているシート「{st.session_state['worksheet_title']}」の「{range_label}」に書式を適用します(値は変更しません)。")
-        st.code(plan["code"], language=None)
+        ops = sheets_core.parse_format_ops(plan["code"], plan.get("range") or "")
+        if ops:
+            st.info(
+                f"現在開いているシート「{st.session_state['worksheet_title']}」に、"
+                f"次の{len(ops)}件の書式をまとめて適用します(値は変更しません)。"
+            )
+            for i, op in enumerate(ops, 1):
+                st.write(f"{i}. `{op['range']}` → {sheets_core.describe_format_spec(op['format'])}")
+            with st.expander("生成された内容(JSON)を表示"):
+                st.code(plan["code"], language="json")
+        else:
+            range_label = plan.get("range") or "(現在のデータ範囲全体)"
+            st.info(f"現在開いているシート「{st.session_state['worksheet_title']}」の「{range_label}」に書式を適用します(値は変更しません)。")
+            st.code(plan["code"], language=None)
 
     if action in ("write_current", "write_new") and not plan.get("dynamic") and not sheets_core.looks_safe(plan["code"]):
         st.error("安全でない可能性のあるコードが検出されたため実行できません。")
@@ -699,21 +737,48 @@ def _execute_plan_once(plan: dict, flash_success):
                 ws = sh.worksheet(st.session_state["worksheet_title"])
                 offset = st.session_state.get("header_offset", 0)
                 # 直前にシートの最新状態を取得し直してから範囲を決める(未指定時のデフォルト範囲用)。
-                range_a1 = plan.get("range") or sheets_core.data_range_a1(ws, offset)
-                format_spec = sheets_core.parse_format_spec(plan["code"])
-                if not format_spec:
+                default_range = plan.get("range") or sheets_core.data_range_a1(ws, offset)
+                ops = sheets_core.parse_format_ops(plan["code"], default_range)
+                if not ops:
                     raise RuntimeError("適用する書式を解析できませんでした。")
-                prev_format = sheets_core.get_cell_format(sh, ws, range_a1.split(":")[0])
-                sheets_core.apply_cell_format(ws, range_a1, format_spec)
-                _push_history({
-                    "action": "apply_format",
-                    "worksheet_title": ws.title,
-                    "range": range_a1,
-                    "format_spec": format_spec,
-                    "prev_format": prev_format,
-                    "description": f"「{ws.title}」の「{range_a1}」に書式を適用: {instruction}",
-                })
-                flash_success(f"「{ws.title}」の「{range_a1}」に書式を適用しました。")
+
+                # undo用に、各範囲の適用前の書式を先に控えておく。
+                for op in ops:
+                    op["prev_format"] = sheets_core.get_cell_format(sh, ws, op["range"].split(":")[0])
+
+                results = sheets_core.apply_format_ops(ws, ops)
+                succeeded = [op for op, r in zip(ops, results) if r["ok"]]
+                failed = [(op, r) for op, r in zip(ops, results) if not r["ok"]]
+
+                if succeeded:
+                    # 成功した操作だけを履歴に積む(失敗分をundoしようとしないため)。
+                    ranges_label = "、".join(op["range"] for op in succeeded)
+                    _push_history({
+                        "action": "apply_format",
+                        "worksheet_title": ws.title,
+                        "ops": succeeded,
+                        # 旧形式(単一range)の履歴との互換のため、代表値も残しておく。
+                        "range": succeeded[0]["range"],
+                        "format_spec": succeeded[0]["format"],
+                        "prev_format": succeeded[0]["prev_format"],
+                        "description": f"「{ws.title}」の{len(succeeded)}箇所に書式を適用: {instruction}",
+                    })
+
+                if failed and not succeeded:
+                    detail = "、".join(f"{op['range']}({r['error']})" for op, r in failed)
+                    raise RuntimeError(f"書式の適用に失敗しました: {detail}")
+
+                if failed:
+                    # 一部だけ失敗した場合はクラッシュさせず、成功分を残したまま内訳を表示する。
+                    st.session_state["format_failures"] = [
+                        {"range": op["range"], "error": r["error"]} for op, r in failed
+                    ]
+                    flash_success(
+                        f"「{ws.title}」の{len(succeeded)}件の書式を適用しました"
+                        f"({len(failed)}件は失敗しました)。"
+                    )
+                else:
+                    flash_success(f"「{ws.title}」の{len(succeeded)}件の書式を適用しました({ranges_label})。")
 
 
 def _execute_plan(plan: dict, attempt: int = 1):
@@ -832,6 +897,7 @@ def main():
         st.rerun()
 
     _show_flash()
+    _show_format_failures()
     _show_api_key_warning()
     load_sheet_section()
 

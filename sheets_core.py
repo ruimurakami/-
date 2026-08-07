@@ -125,7 +125,7 @@ SYSTEM_PROMPT = """あなたはGoogleスプレッドシート操作の専門家�
 <RANGE> は MODE が partial の場合の書き込み開始セル。
 - 指示に「H1に」「B3のセルに」のような具体的なセル番地の指定があれば、それをそのまま入れること(例: H1)。
 - 「別のセルに」「空いているところに」「隣に」のように書き込み位置をずらしたいが具体的なセル番地の指定がない場合は、`AUTO` とだけ入れること(アプリ側が既存データと重ならない空きセルを自動的に探して書き込む)。
-- full の場合は無視されるので A1 のままでよい。format_cells / insert_summary では無視されるので A1 のままでよい。apply_format の場合は、書式を適用するセル範囲をA1形式で入れること(例: C2:C100、A1:D1、C:C)。指定がなければ「シート参照情報」のデータ範囲全体を使うこと。
+- full の場合は無視されるので A1 のままでよい。format_cells / insert_summary では無視されるので A1 のままでよい。apply_format の場合は、書式を適用する範囲の既定値をA1形式で入れること(例: C2:C100、A1:D1、C:C)。指定がなければ「シート参照情報」のデータ範囲全体を使うこと(実際の適用範囲は7行目以降のJSONの各要素の `range` で個別に指定するため、ここは各要素で `range` を省略した場合のフォールバックとして使われる)。
 
 <DYNAMIC> は action が write_current または write_new の場合のみ意味を持つ(それ以外は no のままでよい):
 - no: 通常通りpandasコードで一度だけ結果を計算して書き込む(デフォルト)。
@@ -181,14 +181,32 @@ insert_summary の場合の7行目以降のルール:
 ```
 
 apply_format の場合の7行目以降のルール:
-- 適用したい書式を `キー: 値` の形式で1行に1項目ずつ出力すること(指示に含まれる項目だけでよい)。対応するキーは次の4つ:
-  - `NUMBER_FORMAT: <表示形式パターン>` (例: 通貨なら `NUMBER_FORMAT: ¥#,##0`、パーセントなら `NUMBER_FORMAT: 0.0%`、日付なら `NUMBER_FORMAT: yyyy/mm/dd`)
-  - `BACKGROUND_COLOR: <16進数カラーコード>` (例: `BACKGROUND_COLOR: #FFF2CC`)
-  - `BOLD: <true または false>`
-  - `BORDER: <true または false>` (true で指定範囲の全セルに格子状の枠線を付ける)
-- 例(C列を通貨表示にする場合):
+- **JSONの配列**を1つだけ出力すること。配列の要素は「1つの範囲に対する1組の書式」を表すオブジェクトで、
+  複数の範囲・複数種類の書式を一度に指定できる(要素数に制限はない。アプリ側で1回のバッチ処理としてまとめて適用される)。
+- 各オブジェクトで使えるキーは次のとおり(必要なものだけ含めればよい。`range` は必須):
+  - `range`: 適用先のA1範囲(例: `"A1:G1"`、`"F2:F11"`、`"C:C"`)。「シート参照情報」の列文字・行番号から正確に組み立てること。
+  - `background_color`: 背景色の16進数カラーコード(例: `"#CFE2F3"`)
+  - `text_color`: 文字色の16進数カラーコード(例: `"#FFFFFF"`、黒は `"#000000"`)
+  - `bold` / `italic`: `true` または `false`
+  - `font_size`: 文字サイズ(数値)
+  - `number_format`: 表示形式パターン(通貨 `"¥#,##0"`、パーセント `"0.0%"`、日付 `"yyyy/mm/dd"` など)
+  - `horizontal_alignment`: `"LEFT"` / `"CENTER"` / `"RIGHT"`
+  - `border`: `true` で指定範囲の全セルに格子状の枠線を付ける
+  - `border_color`: 罫線の色の16進数カラーコード
+- 色は必ず `"#RRGGBB"` の**文字列**で書くこと。`{"red": 0, "green": 0, "blue": 0}` のようなオブジェクトで書いてはならない(アプリ側で自動変換する)。
+- 指示に複数の装飾(見出しの色・文字色・罫線・表示形式など)が含まれる場合は、**分割せず1回の apply_format の配列にすべて入れること**。
+- JSON以外の説明文やマークダウンの ``` は付けないこと。
+- 例(C列を通貨表示にするだけの場合):
 ```
-NUMBER_FORMAT: ¥#,##0
+[{"range": "C2:C11", "number_format": "¥#,##0"}]
+```
+- 例(見出し行を濃い青背景＋白文字＋太字にし、金額列を通貨表示にし、表全体に罫線を引く場合):
+```
+[
+  {"range": "A1:G1", "background_color": "#1F4E78", "text_color": "#FFFFFF", "bold": true, "horizontal_alignment": "CENTER"},
+  {"range": "F2:F11", "number_format": "¥#,##0"},
+  {"range": "A1:G11", "border": true}
+]
 ```
 
 ---
@@ -208,11 +226,16 @@ result = df[df['ステータス'] != '完了'].reset_index(drop=True)
 ```
 複数条件の場合は `&`(かつ)・`|`(または)を使い、各条件をかっこで囲む: `df[(df['列A'] == 値1) & (df['列B'] > 値2)]`
 
-パターンC(見栄えの装飾。ヘッダーの色付け・全枠線・数値の表示形式などをまとめて指示された場合):
-apply_format を使い、対象範囲ごとに複数回に分けて指示してもらうか、1回の指示で最も重要な1種類の書式(背景色/太字/枠線/数値形式のうち指示で明示されたもの)を適用する。例えば「ヘッダー行を太字にして背景色を薄い青にして」なら:
+パターンC(見栄えの装飾。ヘッダーの色付け・文字色・全枠線・数値の表示形式などをまとめて指示された場合):
+apply_format を使い、指示に含まれるすべての装飾を**1回の配列にまとめて**出力する(範囲ごとに要素を分ける)。
+複数の装飾を指示されたからといって、一部だけを適用したり、複数回に分けるようユーザーに促したりしてはならない。
+例(データがA1:G11、ヘッダーが1行目、売上金額がF列で「見出しを目立たせて、金額は円表示にして、表全体に罫線を引いて」の場合):
 ```
-BACKGROUND_COLOR: #CFE2F3
-BOLD: true
+[
+  {"range": "A1:G1", "background_color": "#CFE2F3", "bold": true, "horizontal_alignment": "CENTER"},
+  {"range": "F2:F11", "number_format": "¥#,##0"},
+  {"range": "A1:G11", "border": true}
+]
 ```
 
 パターンD(「一番◯◯なデータ」「最大値の行」等、関数名を指定しない最大/最小抽出の指示):
@@ -232,6 +255,7 @@ DYNAMIC: yes とする。「売上高データ」シートのデータがA2:F11�
 - ACTION/TARGET_SHEET/MODE/RANGE/DYNAMIC/COLOR/SUMMARY の7行はすべて省略せず出力したか。
 - 数式・SUMIFS/VLOOKUP等で使った列文字は、すべて「シート参照情報」または「他のシートの情報」の対応表からそのままコピーしたものであり、暗算・目算で推測した文字が紛れ込んでいないか。
 - DYNAMIC: no の Python コードは、どの分岐を通っても最後に `result` に DataFrame が代入されているか(代入されない可能性がある書き方になっていないか)。
+- apply_format の場合、出力は妥当なJSON配列になっているか。指示に含まれる装飾を1つも取りこぼさず、すべて配列の要素に入れたか。色は `"#RRGGBB"` の文字列で書いたか。
 """
 
 FORBIDDEN_PATTERNS = ["import os", "open(", "__import__", "exec(", "eval(", "subprocess", "sys."]
@@ -451,7 +475,8 @@ def strip_code_fence(text: str) -> str:
     余計なプロンプト文がコードとして実行されるのを防ぐ。フェンスが無い場合は
     そのまま返す(呼び出し側の構文検証で異常な出力を弾く)。
     """
-    match = re.search(r"```(?:python|py)?\s*\n?(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
+    # 言語タグ(python / py / json など)は何が付いていても取り除く。
+    match = re.search(r"```[a-zA-Z0-9_+-]*[ \t]*\n?(.*?)\n?```", text, re.DOTALL)
     return match.group(1) if match else text
 
 
@@ -732,13 +757,89 @@ def delete_worksheet_if_exists(sh: gspread.Spreadsheet, title: str) -> None:
     sh.del_worksheet(ws)
 
 
-def _hex_to_rgb(hex_color: str) -> dict:
-    hex_color = hex_color.lstrip("#")
-    return {
-        "red": int(hex_color[0:2], 16) / 255,
-        "green": int(hex_color[2:4], 16) / 255,
-        "blue": int(hex_color[4:6], 16) / 255,
-    }
+# Google Sheets API の CellFormat 内で「色オブジェクト」が入る位置のキー名。
+# ここに16進数カラーコードの文字列がそのまま入っていると API が 400 を返すため、
+# normalize_format_colors() で RGB オブジェクトへ変換する。
+COLOR_FIELD_KEYS = ("backgroundColor", "foregroundColor", "color")
+
+_HEX_COLOR_RE = re.compile(r"^#?(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def is_hex_color(value) -> bool:
+    """`#000000` `#fff` `FFFFFF` のような16進数カラーコード文字列かどうか。"""
+    return isinstance(value, str) and bool(_HEX_COLOR_RE.match(value.strip()))
+
+
+def hex_to_rgb(hex_color: str) -> dict:
+    """`#000000` 形式のカラーコードを Sheets API の RGB オブジェクトへ変換する。
+
+    >>> hex_to_rgb("#000000")
+    {'red': 0.0, 'green': 0.0, 'blue': 0.0}
+
+    `#fff` のような3桁表記、`#` なし、大文字小文字の混在にも対応する。
+    変換できない値を渡した場合は ValueError を送出する。
+    """
+    if not isinstance(hex_color, str):
+        raise ValueError(f"カラーコードは文字列で指定してください: {hex_color!r}")
+    value = hex_color.strip().lstrip("#")
+    if len(value) == 3:  # #fff -> #ffffff
+        value = "".join(ch * 2 for ch in value)
+    if len(value) != 6:
+        raise ValueError(f"カラーコードの形式が不正です: {hex_color!r}")
+    try:
+        channels = [int(value[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    except ValueError as exc:
+        raise ValueError(f"カラーコードの形式が不正です: {hex_color!r}") from exc
+    return {"red": channels[0], "green": channels[1], "blue": channels[2]}
+
+
+def rgb_to_hex(rgb: dict) -> str:
+    """Sheets API の RGB オブジェクトを `#RRGGBB` 形式のカラーコードへ逆変換する。
+
+    >>> rgb_to_hex({"red": 0.0, "green": 0.0, "blue": 0.0})
+    '#000000'
+
+    Sheets API は値が 0 のチャンネルをレスポンスから省略することがあるため、
+    キーが欠けている場合は 0 とみなす。
+    """
+    if not isinstance(rgb, dict):
+        raise ValueError(f"RGBオブジェクトは辞書で指定してください: {rgb!r}")
+    parts = []
+    for key in ("red", "green", "blue"):
+        channel = rgb.get(key, 0) or 0
+        parts.append(max(0, min(255, round(float(channel) * 255))))
+    return "#{:02X}{:02X}{:02X}".format(*parts)
+
+
+def normalize_color(value) -> dict:
+    """カラー指定(16進数文字列 / RGBオブジェクト)を RGB オブジェクトに揃える。"""
+    if isinstance(value, dict):
+        return value
+    return hex_to_rgb(value)
+
+
+def normalize_format_colors(spec):
+    """書式スペックを再帰的に走査し、色の位置にある16進数文字列を RGB オブジェクトへ変換する。
+
+    Sheets API へ渡す直前にこれを通すことで、`{"backgroundColor": "#000000"}` の
+    ような文字列指定が API に到達して 400 エラーになるのを防ぐ。
+    """
+    if isinstance(spec, list):
+        return [normalize_format_colors(item) for item in spec]
+    if not isinstance(spec, dict):
+        return spec
+
+    normalized = {}
+    for key, value in spec.items():
+        if key in COLOR_FIELD_KEYS and is_hex_color(value):
+            normalized[key] = hex_to_rgb(value)
+        else:
+            normalized[key] = normalize_format_colors(value)
+    return normalized
+
+
+# 旧名(内部利用箇所との互換のため残す)
+_hex_to_rgb = hex_to_rgb
 
 
 def data_range_a1(ws: gspread.Worksheet, header_offset: int = 0) -> str:
@@ -875,7 +976,7 @@ def add_conditional_format(
                             "type": "CUSTOM_FORMULA",
                             "values": [{"userEnteredValue": formula}],
                         },
-                        "format": {"backgroundColor": _hex_to_rgb(color_hex)},
+                        "format": {"backgroundColor": normalize_color(color_hex)},
                     },
                 },
                 "index": 0,
@@ -921,30 +1022,198 @@ def remove_summary_block(ws: gspread.Worksheet, row_count: int) -> None:
     ws.delete_rows(1, row_count)
 
 
+def _border_spec(color_hex: str | None = None) -> dict:
+    border_style = {
+        "style": "SOLID",
+        "width": 1,
+        "color": hex_to_rgb(color_hex) if color_hex else {"red": 0, "green": 0, "blue": 0},
+    }
+    return {side: dict(border_style) for side in ("top", "bottom", "left", "right")}
+
+
+def _apply_format_key(spec: dict, key: str, value) -> None:
+    """1つの書式キーを CellFormat 形式の辞書 `spec` に反映する(未知のキーは無視)。"""
+    key = key.strip().upper()
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "":
+        return
+
+    truthy = value is True or (isinstance(value, str) and value.lower() == "true")
+    falsy = value is False or (isinstance(value, str) and value.lower() == "false")
+
+    if key == "NUMBER_FORMAT":
+        spec["numberFormat"] = {"type": "NUMBER", "pattern": value}
+    elif key == "BACKGROUND_COLOR":
+        spec["backgroundColor"] = normalize_color(value)
+    elif key == "TEXT_COLOR":
+        spec.setdefault("textFormat", {})["foregroundColor"] = normalize_color(value)
+    elif key == "BOLD" and (truthy or falsy):
+        spec.setdefault("textFormat", {})["bold"] = truthy
+    elif key == "ITALIC" and (truthy or falsy):
+        spec.setdefault("textFormat", {})["italic"] = truthy
+    elif key == "FONT_SIZE":
+        spec.setdefault("textFormat", {})["fontSize"] = int(value)
+    elif key == "HORIZONTAL_ALIGNMENT" and str(value).upper() in ("LEFT", "CENTER", "RIGHT"):
+        spec["horizontalAlignment"] = str(value).upper()
+    elif key == "BORDER" and truthy:
+        spec["borders"] = _border_spec()
+    elif key == "BORDER_COLOR":
+        spec["borders"] = _border_spec(value if is_hex_color(value) else None)
+
+
 def parse_format_spec(code: str) -> dict:
-    """apply_format の `キー: 値` 形式の行を、gspread の format() に渡せる辞書に変換する。"""
+    """apply_format の `キー: 値` 形式の行を、gspread の format() に渡せる辞書に変換する。
+
+    複数操作(JSON配列)には parse_format_ops() を使うこと。この関数は
+    単一の書式ブロックを解釈する下位関数として残している。
+    """
     spec: dict = {}
     for line in code.splitlines():
         line = line.strip()
         if not line or ":" not in line:
             continue
         key, _, value = line.partition(":")
-        key, value = key.strip().upper(), value.strip()
-        if key == "NUMBER_FORMAT" and value:
-            spec["numberFormat"] = {"type": "NUMBER", "pattern": value}
-        elif key == "BACKGROUND_COLOR" and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
-            spec["backgroundColor"] = _hex_to_rgb(value)
-        elif key == "BOLD":
-            spec.setdefault("textFormat", {})["bold"] = value.lower() == "true"
-        elif key == "BORDER" and value.lower() == "true":
-            border_style = {"style": "SOLID", "width": 1, "color": {"red": 0, "green": 0, "blue": 0}}
-            spec["borders"] = {
-                "top": border_style,
-                "bottom": border_style,
-                "left": border_style,
-                "right": border_style,
-            }
+        try:
+            _apply_format_key(spec, key, value)
+        except (ValueError, TypeError):
+            # 1つのキーの値が不正でも、他のキーの適用は続ける。
+            continue
     return spec
+
+
+def _op_from_mapping(item: dict) -> dict:
+    """JSONの1操作(辞書)を {"range": ..., "format": CellFormat} に変換する。"""
+    spec: dict = {}
+    range_a1 = ""
+    for key, value in item.items():
+        if key.strip().upper() == "RANGE":
+            range_a1 = str(value).strip()
+            continue
+        try:
+            _apply_format_key(spec, key, value)
+        except (ValueError, TypeError):
+            continue
+    return {"range": range_a1, "format": spec}
+
+
+def parse_format_ops(code: str, default_range: str = "") -> list[dict]:
+    """apply_format の内容を「複数の書式操作のリスト」として解釈する。
+
+    受け付ける形式:
+    1. JSON配列(推奨。複数操作をまとめて指示する場合):
+       `[{"range": "A1:G1", "background_color": "#CFE2F3", "bold": true}, ...]`
+    2. JSONオブジェクト単体: `{"range": "A1:G1", "bold": true}`
+    3. 従来の `キー: 値` 行形式(1操作のみ)。`RANGE:` 行が現れるたびに次の操作として扱う。
+
+    range が空の操作には default_range を補う。書式が1つも解釈できなかった操作は捨てる。
+    """
+    text = strip_code_fence(code).strip()
+    ops: list[dict] = []
+
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            ops = [_op_from_mapping(item) for item in parsed if isinstance(item, dict)]
+
+    if not ops:
+        # 従来の行形式。RANGE行を区切りとして複数ブロックに対応する。
+        current: dict = {"range": "", "format": {}}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            if key.strip().upper() == "RANGE":
+                if current["format"]:
+                    ops.append(current)
+                current = {"range": value.strip(), "format": {}}
+                continue
+            try:
+                _apply_format_key(current["format"], key, value)
+            except (ValueError, TypeError):
+                continue
+        if current["format"]:
+            ops.append(current)
+
+    result = []
+    for op in ops:
+        if not op["format"]:
+            continue
+        op["range"] = op["range"] or default_range
+        if not op["range"]:
+            continue
+        op["format"] = normalize_format_colors(op["format"])
+        result.append(op)
+    return result
+
+
+def apply_format_ops(ws: gspread.Worksheet, ops: list[dict]) -> list[dict]:
+    """複数の書式操作を1回の batchUpdate でまとめて適用する。
+
+    まず全操作を requests リストにまとめて一括送信し(gspread の batch_format が
+    repeatCell リクエストの配列を1回の batchUpdate で送る)、それが失敗した場合は
+    1操作ずつ個別に適用し直して、どれが成功・失敗したかを切り分ける。
+
+    戻り値は各操作の結果リスト:
+    `[{"range": "A1:G1", "ok": True, "error": None}, ...]`
+    1つ失敗しても例外は送出しない(呼び出し側が結果を見て表示する)。
+    """
+    if not ops:
+        return []
+
+    payload = [{"range": op["range"], "format": op["format"]} for op in ops]
+    try:
+        ws.batch_format(payload)
+    except Exception as batch_exc:  # noqa: BLE001
+        # 一括送信は1件でも不正があると全体が失敗するため、個別適用に切り替える。
+        results = []
+        for op in ops:
+            try:
+                ws.format(op["range"], op["format"])
+            except Exception as exc:  # noqa: BLE001
+                results.append({
+                    "range": op["range"],
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            else:
+                results.append({"range": op["range"], "ok": True, "error": None})
+        if all(not r["ok"] for r in results):
+            # 全滅した場合は一括送信時のエラーの方が原因を表していることが多い。
+            for r in results:
+                r["error"] = r["error"] or str(batch_exc)
+        return results
+
+    return [{"range": op["range"], "ok": True, "error": None} for op in ops]
+
+
+def describe_format_spec(spec: dict) -> str:
+    """書式スペックを確認画面表示用の日本語1行に要約する。"""
+    parts = []
+    if "backgroundColor" in spec:
+        parts.append(f"背景色 {rgb_to_hex(spec['backgroundColor'])}")
+    text_format = spec.get("textFormat", {})
+    if "foregroundColor" in text_format:
+        parts.append(f"文字色 {rgb_to_hex(text_format['foregroundColor'])}")
+    if text_format.get("bold"):
+        parts.append("太字")
+    if text_format.get("italic"):
+        parts.append("斜体")
+    if "fontSize" in text_format:
+        parts.append(f"文字サイズ {text_format['fontSize']}")
+    if "numberFormat" in spec:
+        parts.append(f"表示形式 {spec['numberFormat'].get('pattern', '')}")
+    if "horizontalAlignment" in spec:
+        parts.append(f"横位置 {spec['horizontalAlignment']}")
+    if "borders" in spec:
+        parts.append("罫線")
+    return " / ".join(parts) if parts else "(書式なし)"
 
 
 def get_cell_format(sh: gspread.Spreadsheet, ws: gspread.Worksheet, cell_a1: str) -> dict:
@@ -970,4 +1239,6 @@ def apply_cell_format(ws: gspread.Worksheet, range_a1: str, format_spec: dict) -
     """
     if not format_spec:
         return
-    ws.format(range_a1, format_spec)
+    # 呼び出し側やAIの出力に `"backgroundColor": "#000000"` のような
+    # 文字列指定が混ざっていても、ここで RGB オブジェクトへ変換してから送る。
+    ws.format(range_a1, normalize_format_colors(format_spec))
